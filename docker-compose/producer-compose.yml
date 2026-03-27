@@ -1,0 +1,65 @@
+# Producer Docker Compose
+#
+# Runs the Bluesky producer and topic creator on a dedicated lightweight VM.
+# Connects to the Kafka cluster via bootstrap servers.
+#
+# Required env vars (set by cloud-init):
+#   KAFKA_BOOTSTRAP_SERVERS — Comma-separated broker list (e.g., 10.0.1.20:9092,10.0.1.21:9092)
+#   PRODUCER_USER_HOME      — Home directory of the deploy user
+#   BLUESKY_PRODUCER_IMAGE  — Docker image for the Bluesky producer
+#   LOKI_ENDPOINT           — Loki push URL (e.g., http://10.0.0.x:3100)
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  topic-creator:
+    image: apache/kafka:4.2
+    container_name: topic-creator
+    volumes:
+      - ${PRODUCER_USER_HOME}/kafka-configs/topics:/topics:ro
+    environment:
+      - KAFKA_BOOTSTRAP_SERVER=${KAFKA_BOOTSTRAP_SERVERS}
+    entrypoint: ["/bin/bash", "/topics/create_topics.sh"]
+    restart: "no"
+
+  bluesky-producer:
+    image: ${BLUESKY_PRODUCER_IMAGE:-bluesky-producer:latest}
+    build: ${PRODUCER_USER_HOME}/kafka-producers/bluesky-jetstream
+    container_name: bluesky-producer
+    depends_on:
+      topic-creator:
+        condition: service_completed_successfully
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
+      - KAFKA_TOPIC=bluesky-posts
+      - JETSTREAM_URL=wss://jetstream2.us-east.bsky.network/subscribe
+      - JETSTREAM_COLLECTIONS=app.bsky.feed.post
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.25"
+    restart: unless-stopped
+
+  # Promtail — ships all container logs to Loki
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: promtail
+    volumes:
+      - ${PRODUCER_USER_HOME}/kafka-configs/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/promtail-positions:/tmp
+    command: -config.file=/etc/promtail/config.yml -config.expand-env=true
+    environment:
+      - LOKI_ENDPOINT=${LOKI_ENDPOINT}
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: '0.1'
+    restart: unless-stopped

@@ -1,0 +1,25 @@
+services:
+  stress-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - BOOTSTRAP_SERVERS=${BOOTSTRAP_SERVERS:-kafka:9092}
+      - TOPIC=${TOPIC:-stress-test}
+      - RATE=${RATE:-100}
+      - MESSAGE_SIZE=${MESSAGE_SIZE:-1024}
+      - DURATION=${DURATION:-60}
+      - ACKS=${ACKS:-all}
+    command:
+      - "--bootstrap-servers"
+      - "${BOOTSTRAP_SERVERS:-kafka:9092}"
+      - "--topic"
+      - "${TOPIC:-stress-test}"
+      - "--rate"
+      - "${RATE:-100}"
+      - "--message-size"
+      - "${MESSAGE_SIZE:-1024}"
+      - "--duration"
+      - "${DURATION:-60}"
+      - "--acks"
+      - "${ACKS:-all}"
