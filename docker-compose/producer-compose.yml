@@ -19,7 +19,9 @@ x-logging: &default-logging
 services:
   bluesky-producer:
     image: ${BLUESKY_PRODUCER_IMAGE:-bluesky-producer:latest}
-    build: ${PRODUCER_USER_HOME}/kafka-producers/bluesky-jetstream
+    build:
+      context: ${PRODUCER_USER_HOME}/kafka-producers
+      dockerfile: bluesky-jetstream/Dockerfile
     container_name: bluesky-producer
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
