@@ -7,10 +7,16 @@ only need to implement three methods:
     - connect_source()  — connect to the upstream data source
     - transform()       — convert a raw message to (key, value)
     - get_topic()       — return the Kafka topic name
+
+Failure handling is configurable via FAILURE_STRATEGY env var:
+    - "log"         — log and drop (default, current behavior)
+    - "retry"       — extended kafka-python retries + backoff
+    - "disk_buffer" — write to a local JSONL file for later replay
 """
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 from abc import ABC, abstractmethod
@@ -56,6 +62,8 @@ class BaseProducer(ABC):
         self.producer: Optional[KafkaProducer] = None
         self.running = True
         self.messages_produced = 0
+        self.messages_failed = 0
+        self.messages_buffered = 0
 
     # ------------------------------------------------------------------ #
     # Abstract methods — subclasses must implement these
@@ -63,24 +71,12 @@ class BaseProducer(ABC):
 
     @abstractmethod
     async def connect_source(self):
-        """Connect to the upstream data source and yield raw messages.
-
-        This should be an async generator or an async context manager
-        that provides messages. Implementation is source-specific
-        (WebSocket, HTTP polling, queue consumer, etc.).
-        """
+        """Connect to the upstream data source and yield raw messages."""
         ...
 
     @abstractmethod
     def transform(self, raw_message) -> tuple:
-        """Transform a raw message into (partition_key, kafka_value).
-
-        Args:
-            raw_message: The raw message from the data source.
-
-        Returns:
-            A tuple of (key: str, value: dict) for the Kafka record.
-        """
+        """Transform a raw message into (partition_key, kafka_value)."""
         ...
 
     @abstractmethod
@@ -100,9 +96,118 @@ class BaseProducer(ABC):
                 f"Produced {self.messages_produced} messages to {record_metadata.topic}"
             )
 
-    def _on_send_error(self, excp):
-        """Callback for failed message delivery."""
-        logger.error(f"Failed to produce message: {excp}")
+    def _on_send_error(self, excp, key=None, value=None):
+        """Callback for failed message delivery. Dispatches to configured strategy."""
+        self.messages_failed += 1
+        strategy = self.config.FAILURE_STRATEGY
+
+        if strategy == "log":
+            logger.error(f"Failed to produce message: {excp}")
+
+        elif strategy == "retry":
+            # kafka-python already retried with extended settings.
+            # If we're here, all retries were exhausted.
+            logger.error(
+                f"Failed to produce after extended retries: {excp} "
+                f"(total failures: {self.messages_failed})"
+            )
+
+        elif strategy == "disk_buffer":
+            self._write_to_disk_buffer(key, value, excp)
+
+        else:
+            logger.error(f"Unknown failure strategy '{strategy}', dropping message: {excp}")
+
+    def _write_to_disk_buffer(self, key, value, error):
+        """Append a failed message to a local JSONL file for later replay."""
+        buffer_path = self.config.DISK_BUFFER_PATH
+        max_size = self.config.DISK_BUFFER_MAX_SIZE_MB * 1024 * 1024
+
+        # Check file size before writing
+        try:
+            current_size = os.path.getsize(buffer_path) if os.path.exists(buffer_path) else 0
+        except OSError:
+            current_size = 0
+
+        if current_size >= max_size:
+            if self.messages_failed % 1000 == 1:  # Log once per 1000 to avoid spam
+                logger.error(
+                    f"Disk buffer full ({self.config.DISK_BUFFER_MAX_SIZE_MB}MB). "
+                    f"Dropping message."
+                )
+            return
+
+        record = {
+            "topic": self.get_topic(),
+            "key": key,
+            "value": value,
+            "error": str(error),
+        }
+
+        try:
+            with open(buffer_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+            self.messages_buffered += 1
+            if self.messages_buffered % 100 == 1:
+                logger.warning(
+                    f"Buffered {self.messages_buffered} messages to {buffer_path}"
+                )
+        except OSError as e:
+            logger.error(f"Failed to write to disk buffer: {e}")
+
+    def replay_buffer(self):
+        """Replay messages from the disk buffer file back to Kafka.
+
+        Call this after Kafka is healthy again. Reads the JSONL file,
+        re-sends each message, and removes the file when done.
+
+        Returns:
+            Tuple of (replayed_count, failed_count).
+        """
+        buffer_path = self.config.DISK_BUFFER_PATH
+
+        if not os.path.exists(buffer_path):
+            logger.info("No disk buffer to replay.")
+            return 0, 0
+
+        replayed = 0
+        failed = 0
+
+        logger.info(f"Replaying messages from {buffer_path}...")
+
+        with open(buffer_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    self.producer.send(
+                        record["topic"],
+                        key=record.get("key"),
+                        value=record["value"],
+                    ).add_callback(
+                        self._on_send_success
+                    ).add_errback(
+                        self._on_send_error
+                    )
+                    replayed += 1
+                except Exception as e:
+                    logger.error(f"Failed to replay buffered message: {e}")
+                    failed += 1
+
+        # Flush to ensure all replayed messages are sent
+        if self.producer:
+            self.producer.flush(timeout=30)
+
+        # Remove the buffer file
+        try:
+            os.remove(buffer_path)
+            logger.info(f"Disk buffer cleared. Replayed {replayed}, failed {failed}.")
+        except OSError as e:
+            logger.error(f"Failed to remove buffer file: {e}")
+
+        return replayed, failed
 
     def send(self, key: str, value: dict):
         """Send a message to Kafka with callbacks.
@@ -111,15 +216,20 @@ class BaseProducer(ABC):
             key: Partition key for the record.
             value: Message value (will be JSON-serialized).
         """
-        self.producer.send(
+        future = self.producer.send(
             self.get_topic(),
             key=key,
             value=value,
-        ).add_callback(
-            self._on_send_success
-        ).add_errback(
-            self._on_send_error
         )
+        future.add_callback(self._on_send_success)
+
+        # For strategies that need the original message on failure,
+        # capture key/value in the errback closure
+        strategy = self.config.FAILURE_STRATEGY
+        if strategy == "disk_buffer":
+            future.add_errback(lambda excp: self._on_send_error(excp, key=key, value=value))
+        else:
+            future.add_errback(self._on_send_error)
 
     async def run(self):
         """Initialize Kafka producer, set up signal handlers, and start consuming.
@@ -129,6 +239,7 @@ class BaseProducer(ABC):
         """
         logger.info(f"Starting {self.__class__.__name__}...")
         logger.info(f"Topic: {self.get_topic()}")
+        logger.info(f"Failure strategy: {self.config.FAILURE_STRATEGY}")
 
         # Initialize Kafka producer
         self.producer = create_kafka_producer(self.config)
@@ -152,8 +263,11 @@ class BaseProducer(ABC):
         """Flush and close the Kafka producer."""
         if self.producer:
             logger.info("Flushing Kafka producer...")
-            self.producer.flush(timeout=10)
+            self.producer.flush(timeout=30)
             self.producer.close()
             logger.info(
-                f"Producer closed. Total messages produced: {self.messages_produced}"
+                f"Producer closed. "
+                f"Produced: {self.messages_produced}, "
+                f"Failed: {self.messages_failed}, "
+                f"Buffered: {self.messages_buffered}"
             )

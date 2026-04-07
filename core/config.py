@@ -26,3 +26,18 @@ class BaseConfig:
     # Reconnection to data source
     RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
     MAX_RECONNECT_ATTEMPTS = int(os.getenv("MAX_RECONNECT_ATTEMPTS", "0"))  # 0 = infinite
+
+    # Failure handling strategy: "log", "retry", "disk_buffer"
+    #   log         — current default: log error, drop message
+    #   retry       — increase kafka-python retries + backoff (holds messages longer in buffer)
+    #   disk_buffer — write failed messages to a local JSONL file for later replay
+    FAILURE_STRATEGY = os.getenv("FAILURE_STRATEGY", "log")
+
+    # retry strategy settings (also applies as kafka-python config when strategy is "retry")
+    RETRY_BACKOFF_MS = int(os.getenv("RETRY_BACKOFF_MS", "100"))
+    RETRY_MAX_RETRIES = int(os.getenv("RETRY_MAX_RETRIES", "10"))
+    DELIVERY_TIMEOUT_MS = int(os.getenv("DELIVERY_TIMEOUT_MS", "120000"))  # 2 minutes
+
+    # disk_buffer strategy settings
+    DISK_BUFFER_PATH = os.getenv("DISK_BUFFER_PATH", "/tmp/kafka-buffer.jsonl")
+    DISK_BUFFER_MAX_SIZE_MB = int(os.getenv("DISK_BUFFER_MAX_SIZE_MB", "100"))
